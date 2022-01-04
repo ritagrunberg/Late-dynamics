@@ -1,0 +1,958 @@
+---
+title: "Trajectory analysis for late dynamics manuscript"
+author: "Rita Grunbreg"
+date: "11/09/2021"
+output: html_document
+---
+Metadata for bamboo_community and stentor_community.csv
+
+DATE = observation date
+
+JAR = original microcosm coding where B = Bamboo (assemblage A) and S = Stentor (assemblage B) and R = replicate
+
+JAR2 = microcosms coded numerically
+
+TRT= treatment where 1 = +I/+R, 2 = +I/-R, 3 = -I/-R, 4 = -I/+R, 5 = -R for assemblage A, 
+and 6 = +I/+R, 7 = +I/-R, 8= -I/-R, 9= -I/+R, and 10 = -R for assemblage B; 
+I = invader, R = resident, + = evolved - = naive
+
+Columns following TRT are the species present in each assemblage. 
+
+For the invader in the control treatment (-R), the period indicates a value of NA from SAS because these treatments lack the invader by design
+
+Prorodon niveus (a resident) failed to establish in the +R/-I treatment and was therefore analyzed separately in all previous analyses (in analyses that drop that treatment)
+
+DATA ARE MEAN COUNTS PER ML
+
+E. daidaleos invaded Assemblage A. 
+
+```{r setup,  results='hide', message=FALSE, warning=FALSE}
+rm(list = ls())  # clear Rs brain 
+library(readr)   # read csv file
+library(tidyr)   # tidying data
+library(dplyr)   # manipulating df
+library(ggplot2) # graphing
+library(ggpubr)  # nice package for figures
+library(vegan)   # nmds 
+library(trend)   # mann-kendell trend test
+library(lmerTest) #mixed model to be used in piecewise model 
+library(mvabund)
+###############################################################################################################
+bamboo_community <- read_csv("C:/Users/grunberg/Documents/GitHub/Late-dynamics/data/bamboo_community.csv")
+set.seed(123456789)
+```
+Formatting csv files 
+
+Includes making plotting theme and setting color palette
+Adding interpretable treatments into data
+Calculating days between protists counts 
+
+
+*for caras job talk use these colors
+ Darkest green: +I/+R (Coevolved), RBG 61,91,80, '#3D5B50'
+ "darker" medium green: +I/-R (Evolved invaders), RBG 92, 136, 120 "#5C8878"
+ medium green: -I/+R (Evolved residents), RBG 126, 156, 76 "#7E9C4C" 
+ light green: -I/-R (Naïve invasion)RBG 181, 202, 146 "#B5CA92"
+ 
+```{r bamboo community formatting}
+rita_theme <-  theme_classic(base_size = 15)+
+  theme(legend.title = element_text(size=7, face="bold"),
+        legend.text = element_text(size=6.5),
+        legend.position=c(0.15,0.18),
+        axis.line = element_line(colour = 'black', size = 0.75),
+        axis.ticks = element_line(colour = "black", size = 0.75),
+        axis.text.x = element_text(size=12,  colour = "black"), 
+        axis.text.y = element_text(size=12,  colour = "black"), # bold
+        axis.title.y = element_text(size=14, colour = "black")
+  )
+
+#color palette 
+colorpal <- c('#d7191c','#fdae61','#abdda4','#2b83ba') # color for job
+colorpal2 <- c('#d7191c','#fdae61','#abdda4','#2b83ba', '#f0f0f0') # color for MS
+
+unique(bamboo_community$JAR)
+
+Treatments <- data.frame(TRT = seq(1:5),
+                         treat = c("+I/+R", "+I/-R", "-I/-R", "-I/+R", "-R" ),
+                         plot.trt = c("Coevolved", "Evolved invader", "Naive invasion",
+                                      "Evolved residents", "Uninvaded"),
+                         invader_evol = c("evolved", "evolved", "naive", "naive", "naive"),
+                         contrast_invader = c("1", "1", "-1", "-1", "-1"),
+                         resident_evol=c("evolved", "naive", "naive", "evolved", "naive"),
+                         contrast_resident = c("1", "-1", "-1", "1", "NA"),
+                         contrast_interaction =c ("-1", "1","-1", "1", "NA"),
+                        invasion= c("invaded", "invaded", "invaded", "invaded", 'uninvaded')
+                        )
+
+bamboo_community <- bamboo_community %>%
+  mutate(survey_date = as.Date(as.character(DATE), format="%m/%d/%Y"))%>%
+  group_by(JAR) %>% arrange(survey_date) %>%
+  mutate(BETWEEN0=as.numeric(difftime(survey_date,lag(survey_date,1))),
+         BETWEEN=ifelse(is.na(BETWEEN0),0,BETWEEN0),
+         FIRST=cumsum(as.numeric(BETWEEN)))%>%
+  select(-BETWEEN0)%>%
+  drop_na(TRT)
+
+
+bamboo_community <- merge(bamboo_community, Treatments, by =c("TRT"))
+
+#check <-bamboo_community %>% filter(plot.trt == 'Uninvaded')
+
+#bamboo_community %>% group_by(plot.trt) %>% 
+ # mutate(Euplotes_daidaleos1= as.numeric(Euplotes_daidaleos1)) %>%
+  #summarise(maxE = max(Euplotes_daidaleos1),
+   #         maxEp = min(Euplotes_patella))
+
+#dataframe for resident only analysis
+bamboo_community_res <- bamboo_community %>%   
+  select(-c(Euplotes_daidaleos1))  # remove invader 
+
+#dataframe for evolutionary history analysis
+bamboo_community <- bamboo_community %>%   
+  filter(!(treat == "-R")) %>%# remove -R (uninvaded control) not a good comparison bc lacks invader E. daidaleos
+  mutate(Euplotes_daidaleos1= as.numeric(Euplotes_daidaleos1)) 
+
+```
+Now formatting the stentor commmunity aka assemblage B
+
+Added time of the surveys in days to data frame and treatment names for plotting 
+
+I established patterns of similarity using non-metric multi-dimensional scaling on Bray-Curtis distances. Below is the code to run the ordination and extract relevant information for plotting and analysis 
+
+Note that in Assemblage A we excluded Prorodon from the analysis because it did not establish
+
+```{r NMDS assemblage A}
+# create community matrix and envi data matrix 
+bamb_mat<-bamboo_community[,c(6:10,12)] # matrix of protist species
+bamb_mat_treat<-bamboo_community[,c(1:5, 15:19)] # matrix of treatments
+
+ # global nmds
+set.seed(123456789)
+ ordO_pt<-metaMDS(bamb_mat, distance="bray", trymax = 500, autotransform=FALSE)
+ ordO_pt
+
+ #extract info for plotting
+ #add species names to ordination
+  species <- c("B. americanum", "S. teres", "E. patella", "E. daidaleos", "Lecane sp.", #"Prorodon",
+               "P. bursaria")
+  hcoordO<-as.data.frame(scores(ordO_pt, display="sites"))#extracts coordinates for plot
+  pcoordO<-scores(ordO_pt, display="species")#extracts coordinates for parasite vectors
+  pcoordO <-as.data.frame(pcoordO)
+  pcoordO$species <- species
+ 
+  #make dataframe with NMDS coordinates and treatment info 
+ bamboo_all <- bind_cols(bamb_mat_treat, hcoordO)
+ #write.csv(bamboo_all, "NMDS_coordinates_bamboo_assemblage.csv")
+```
+
+Calculate the centroids for analysis and plotting community trjaectories 
+```{r bamboo NMDS centroids}
+cent.bamboo <- bamboo_all %>%
+  group_by(plot.trt, Survey) %>%
+  summarise_at(c("NMDS1", 'NMDS2'), mean)
+```
+
+Graphic of all the data from the NMDS
+
+```{r graphic_NMDS}
+topp1<-max(bamboo_all[,11:12]) #determines maximum and minimum values for the plot axes
+bott1<-min(bamboo_all[,11:12]) #I draw from both data sets because I make the graph sqaure and
+
+#jpeg(filename="AssemblageA_alldata.jpeg", width=180, height=180, units="mm", bg="white", res=300)
+ggplot(bamboo_all, aes(x= NMDS1, y=NMDS2))+
+  geom_hline(yintercept = 0, lty=2, color="grey") +
+  geom_vline(xintercept = 0, lty=2, color="grey") +
+  geom_point( size =5,  pch=21, aes(fill=plot.trt))+
+  xlab("NMDS 1") +
+  ylab("NMDS 2") +
+  # xlim(c( bott-0.1, topp+0.1)) +
+  #ylim(c( bott-0.1, topp+0.1)) +
+  geom_text( aes(x=NMDS1,y=NMDS2, label=Survey), fontface =1, colour = "black" , size=4) + # plant species label
+  geom_text(data=pcoordO, aes(x=NMDS1,y=NMDS2, label=species), fontface =2, colour = "black" , size=3) + # species label
+  scale_fill_manual(values =colorpal)+
+  guides(fill=FALSE)+
+  theme_pubr() +
+  theme(legend.text = element_text(size=8), legend.box = "horizontal",
+        legend.title = element_text(size=9, face="bold"),
+        legend.position=c(0.13,0.85)) +
+  guides(colour = guide_legend(override.aes = list(size=70)))+
+  theme(plot.title = element_text(hjust = 0.5, size=15, face="bold")) + # guides(shape=FALSE)+ 
+  facet_wrap(~plot.trt,
+             ncol = 2, nrow = 3)+
+  guides(fill=FALSE, color=FALSE)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15)) # add black square panel around graphic
+#dev.off()
+```
+Centroids to visualize the trajectories 
+
+```{r graphic_nmds_centroid assemblage A}
+topp<-max(cent.bamboo[,3:4]) #determines maximum and minimum values for the plot axes
+bott<-min(cent.bamboo[,3:4]) #I draw from both data sets because I make the graph sqaure and
+
+# #jpeg(filename="AssemblageA_trajectory.jpeg", width=180, height=180, units="mm", bg="white", res=300)
+jpeg(filename="AssemblageA_trajectory.jpeg", width=180, height=180, units="mm", bg="white", res=300)
+ggplot(data= cent.bamboo, aes(x= NMDS1, y=NMDS2))+
+  geom_hline(yintercept = 0, lty=2, color="grey") +
+  geom_vline(xintercept = 0, lty=2, color="grey") +
+  geom_path(color="#525252", lwd=1)+
+  geom_point( size =6, aes(x= NMDS1, y=NMDS2, fill= plot.trt ),
+              data=cent.bamboo, pch=21)+
+  xlab("NMDS 1") +
+  ylab("NMDS 2") +
+  xlim(c(-1.5, 1)) +
+  ylim(c( -1.0, 1)) +
+  scale_shape_manual(values=c(21,22,23,24))+
+  scale_fill_manual(values =colorpal)+
+  geom_text( aes(x=NMDS1,y=NMDS2, label=Survey), fontface =2, colour = "black" , size=5) + # plant species label
+  geom_text(aes(x=NMDS1,y=NMDS2, label=Survey), fontface =1, colour = "black" , size=4.5) + # plant species label
+  geom_text(data=pcoordO, aes(x=NMDS1,y=NMDS2, label=species), fontface =1, colour = "black" , size=3) + # species label
+  theme_pubr() +
+  theme(legend.text = element_text(size=8), legend.box = "horizontal",
+        legend.title = element_text(size=9, face="bold"),
+        legend.position=c(0.13,0.85)) +
+  guides(colour = guide_legend(override.aes = list(size=70)))+
+  theme(plot.title = element_text(hjust = 0.5, size=15, face="bold")) + # guides(shape=FALSE)+
+  facet_wrap(~plot.trt,
+             ncol = 2, nrow = 2)+
+  guides(fill=FALSE, color=FALSE)+
+  ggtitle("Assemblage A")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15))
+dev.off()
+
+# #dev.off()
+
+```
+
+Below calculates distance between communities for each treatment over time
+this will test for convergence between communities 
+
+```{r trajectory}
+###################################################################################################
+# distance between treatment centroids: how dissimilar are the trajectories btwn groups 
+###################################################################################################
+dist.pt <- function(x1, y1, x2, y2) sqrt((x2-x1)^2 + (y2-y1)^2) # finds distance between points 
+
+cent.bamboo <- bamboo_all %>%
+  group_by(plot.trt, Survey) %>%
+  summarise_at(c("NMDS1", 'NMDS2'), mean) 
+
+trt_list <- unique(cent.bamboo$plot.trt)
+dist_btw_trt <- data.frame()
+
+for (i in trt_list){
+  for(j in trt_list){
+    
+    treat <- i
+    treat2 <- j 
+    
+    trt_one <- cent.bamboo %>% filter  (plot.trt == i )
+    trt_two <- cent.bamboo %>% filter  (plot.trt == j )
+    trt_merge <- merge(trt_one, trt_two, by = c("Survey"))
+    
+    TIME1 <- dist.pt (trt_merge[1,3], trt_merge[1,4],trt_merge[1,6], trt_merge[1,7] )
+    TIME2<- dist.pt (trt_merge[2,3], trt_merge[2,4],trt_merge[2,6], trt_merge[2,7] )
+    TIME3 <- dist.pt (trt_merge[3,3], trt_merge[3,4],trt_merge[3,6], trt_merge[3,7] )
+    TIME4 <- dist.pt (trt_merge[4,3], trt_merge[4,4],trt_merge[4,6], trt_merge[4,7] )
+    TIME5 <- dist.pt (trt_merge[5,3], trt_merge[5,4],trt_merge[5,6], trt_merge[5,7] )
+    TIME6 <- dist.pt (trt_merge[6,3], trt_merge[6,4],trt_merge[6,6], trt_merge[6,7] )
+    TIME7 <- dist.pt (trt_merge[7,3], trt_merge[7,4],trt_merge[7,6], trt_merge[7,7] )
+    TIME8 <- dist.pt (trt_merge[8,3], trt_merge[8,4],trt_merge[8,6], trt_merge[8,7] )
+    TIME9 <- dist.pt (trt_merge[9,3], trt_merge[9,4],trt_merge[9,6], trt_merge[9,7] )
+    
+    
+    dist_btwn_community <- data.frame(i, j, TIME1, TIME2, TIME3, TIME4, TIME5, TIME6, TIME7, TIME8, TIME9)
+    dist_btw_trt <-rbind(dist_btw_trt, dist_btwn_community)
+  }
+}
+
+col_head <- c('Treat1',"Treat2", '1',"2", "3", "4", "5", "6", "7", "8", "9")
+colnames(dist_btw_trt) <- col_head
+
+dist_btw_tidy_1 <- dist_btw_trt %>%
+  gather(time, distance, 3:11) %>%
+  mutate(type =rep("centroid"))
+```
+
+Man kendall trend test to detect trends in convergence or divergence between communities 
+
+```{r man_kendall assemblage A}
+###################################################################################################
+# trajectory analysis 
+###################################################################################################
+exptime <- bamboo_community %>% select(Survey, FIRST) %>% group_by(Survey) %>% summarise_all(mean) %>%
+  mutate(time = as.character(Survey))
+dist_btw_tidy <- merge(dist_btw_tidy_1, exptime, by =c("time"))
+
+mk_cent <- dist_btw_tidy %>% 
+  filter(Treat1== "Coevolved") %>%
+  filter(Treat2 == "Evolved residents") %>%
+  mutate(time = as.numeric(time))%>% arrange(time)
+
+mk_test1 <- mk.test(mk_cent$distance)
+mk_slope <- sens.slope(mk_cent$distance)
+
+mk_test1$estimates[3] # extract tau
+mk_test1$p.value # extract pvalue from trend test 
+mk_slope$estimates # extract slope 
+mk_slope$p.value
+
+# okay moving on... 
+trt_level_mk_test <- dist_btw_tidy %>% 
+  group_by(Treat1, Treat2) %>%  
+  mutate(day = as.numeric(FIRST))%>% 
+  arrange(day) %>%
+  mutate(mann_kendall_tau = mk.test(distance)$estimates[3],
+         mann_kendall_pvalue = mk.test(distance)$p.value,
+         sens_slope = sens.slope(distance)$estimate,
+         sens_pvalue = sens.slope(distance)$p.value) %>%
+  group_by(Treat1, Treat2) %>%
+  summarise_at(c("mann_kendall_tau", "mann_kendall_pvalue", "sens_slope", "sens_pvalue"), mean)
+
+```
+Generates convergence matrix for Assemblage A to quickly see the results and highlight significant trends 
+
+```{r graphic_convergence assemblage A}
+converg_matrix <- trt_level_mk_test %>% 
+  select(Treat1, Treat2, mann_kendall_tau) %>% # arrange(Treat1) %>% arrange(Treat)%>%
+  spread(Treat2, mann_kendall_tau) %>% 
+  replace(., is.na(.), 0)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+
+signif <- trt_level_mk_test %>%
+mutate(signif.p = case_when((mann_kendall_pvalue < 0.05) ~ 0, 
+                              (mann_kendall_pvalue > 0.05) ~ 1))%>%
+  select(Treat1, Treat2, mann_kendall_pvalue, signif.p) 
+conv_low <- get_lower_tri(converg_matrix)
+convergence <- conv_low %>% 
+  gather(Treat2, mann_kendall_tau, 2:5) %>%
+  mutate(index = "Bray-Curtis")
+convergence <- merge(convergence, signif, by = c("Treat1", "Treat2"))
+
+mktrend <-convergence%>% 
+  ggplot(aes(x=Treat1, y = Treat2, fill=mann_kendall_tau))+
+  theme_bw(base_size =10)+
+  geom_raster(aes(x=Treat1, y = Treat2, fill=mann_kendall_tau))+
+  scale_fill_gradientn(limits = c(-1,1), 
+                       breaks=c(-1,0,1),
+                       colours=c('#d53e4f','#ffffbf','#3288bd'),
+                       na.value = 'white',
+                       name='Tau')+
+  labs(x="", y="") +
+  geom_text(aes(x=Treat1, y = Treat2, label=round(mann_kendall_tau,2)), size=3, vjust=1)+ 
+  geom_text(data=subset(convergence, mann_kendall_pvalue < 0.05), 
+            aes(x=Treat1, y = Treat2, label="*"), 
+            size=9, color="white", vjust=0.2, hjust=-1)+ 
+  geom_text(data=subset(convergence, mann_kendall_tau < -0.9),
+            aes(x=Treat1, y = Treat2, label=round(mann_kendall_tau,2)),
+            size=10, color="#bdbdbd",  vjust=1)+ 
+  theme(axis.title.x=element_blank(),
+        # axis.text.x=element_blank(),
+        # axis.ticks.x=element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.background = element_blank(),
+        axis.ticks = element_blank(),
+        legend.justification = c(1, 0),
+        legend.position = c(0.5, 0.8),
+        legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))+
+  theme(axis.text.x = element_text( angle=90))+
+  guides(fill=FALSE)
+#jpeg(filename="convergence_AssemblageA.jpeg", width=90, height=120, units="mm", bg="white", res=300)
+mktrend
+#dev.off()
+
+```
+Lets look at all the comparisons
+
+```{r all comparisons}
+
+#jpeg(filename="convergence_allcomparions_AssemblageA.jpeg", width=270, height=270, units="mm", bg="white", res=300)
+dist_btw_tidy %>%
+  #filter(!(Treat1==Treat2))%>%
+  ggplot() +
+  geom_point(aes(x= as.numeric(FIRST), y = distance), size=4)+
+   geom_smooth(method='lm',aes(x= as.numeric(FIRST), y = distance), se=FALSE, col='black')+
+  labs(x="days", y="distance between communities")+
+  facet_wrap(~Treat1*Treat2, scales = 'free_y')+
+  rita_theme+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15))
+#dev.off()
+```
+
+~~~~~~~~~~~~~~~~~~ Now doing trajectory analysis for residents only, and including the uninvaded control into trajectory analysis
+
+*** note that the invader was removed from the following analysis 
+
+```{r NMDS assemblage A resident}
+# create community matrix and envi data matrix 
+bamb_mat<-bamboo_community_res[,c(6:9,11)] # matrix of protist species
+bamb_mat_treat<-bamboo_community_res[,c(1:5, 14:18)] # matrix of treatments
+
+ # global nmds
+set.seed(123456789)
+ ordO_pt<-metaMDS(bamb_mat, distance="bray", trymax = 500, autotransform=FALSE)
+ ordO_pt
+
+ #extract info for plotting
+ #add species names to ordination
+  species <- c("Blepharisma", "Spirostomum", "Euplotes patella", "Lecane", #"Prorodon",
+               "Paramecium bursaria")
+  hcoordO<-as.data.frame(scores(ordO_pt, display="sites"))#extracts coordinates for plot
+  pcoordO<-scores(ordO_pt, display="species")#extracts coordinates for parasite vectors
+  pcoordO <-as.data.frame(pcoordO)
+  pcoordO$species <- species
+ 
+  #make dataframe with NMDS coordinates and treatment info 
+ bamboo_all_resident <- bind_cols(bamb_mat_treat, hcoordO)
+ #write.csv(bamboo_all, "NMDS_coordinates_bamboo_assemblage.csv")
+ 
+ cent.bamboo.res <- bamboo_all_resident %>%
+  group_by(plot.trt, Survey) %>%
+  summarise_at(c("NMDS1", 'NMDS2'), mean)
+```
+This is the centroid graphic for the residents only 
+
+```{r graphic_nmds_centroid assemblage A resident only}
+topp<-max(cent.bamboo.res[,3:4]) #determines maximum and minimum values for the plot axes
+bott<-min(cent.bamboo.res[,3:4]) #I draw from both data sets because I make the graph sqaure and
+
+# #jpeg(filename="AssemblageA_trajectory_residentonly.jpeg", width=180, height=180, units="mm", bg="white", res=300)
+ggplot(data= cent.bamboo.res, aes(x= NMDS1, y=NMDS2, group=plot.trt))+
+  geom_hline(yintercept = 0, lty=2, color="grey") +
+  geom_vline(xintercept = 0, lty=2, color="grey") +
+  geom_path(color="#525252", lwd=1)+
+  geom_point( size =6, aes(x= NMDS1, y=NMDS2, fill= plot.trt), 
+              pch=21)+
+  xlab("NMDS 1") +
+  ylab("NMDS 2") +
+  xlim(c( bott, topp)) +
+  ylim(c( bott, topp)) +
+  scale_fill_manual(values =colorpal2)+
+  geom_text( aes(x=NMDS1,y=NMDS2, label=Survey), fontface =2, colour = "black" , size=5) + # plant species label
+  geom_text(aes(x=NMDS1,y=NMDS2, label=Survey), fontface =1, colour = "black" , size=4.5) + # plant species label
+ # geom_text(data=pcoordO, aes(x=NMDS1,y=NMDS2, label=species), fontface =2, colour = "black" , size=2) + # species label
+  theme_pubr() +
+  theme(legend.text = element_text(size=8), legend.box = "horizontal",
+        legend.title = element_text(size=9, face="bold"),
+        legend.position=c(0.13,0.85)) +
+  guides(colour = guide_legend(override.aes = list(size=70)))+
+  theme(plot.title = element_text(hjust = 0.5, size=15, face="bold")) + # guides(shape=FALSE)+
+facet_wrap(~plot.trt,
+             ncol = 2, nrow = 3)+
+  guides(fill=FALSE, color=FALSE)+
+  ggtitle("Assemblage A")+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15)) # add black square panel around graphic
+# #dev.off()
+```
+
+```{r trajectory resident only}
+###################################################################################################
+# distance between treatment centroids: how dissimilar are the trajectories btwn groups 
+###################################################################################################
+dist.pt <- function(x1, y1, x2, y2) sqrt((x2-x1)^2 + (y2-y1)^2) # finds distance between points 
+
+cent.bamboo.res <- bamboo_all_resident %>%
+  group_by(plot.trt, Survey) %>%
+  summarise_at(c("NMDS1", 'NMDS2'), mean) 
+
+trt_list <- unique(cent.bamboo.res$plot.trt)
+dist_btw_trt_resident <- data.frame()
+
+for (i in trt_list){
+  for(j in trt_list){
+    
+    treat <- i
+    treat2 <- j 
+    
+    trt_one <- cent.bamboo.res %>% filter  (plot.trt == i )
+    trt_two <- cent.bamboo.res %>% filter  (plot.trt == j )
+    trt_merge <- merge(trt_one, trt_two, by = c("Survey"))
+    
+    TIME1 <- dist.pt (trt_merge[1,3], trt_merge[1,4],trt_merge[1,6], trt_merge[1,7] )
+    TIME2<- dist.pt (trt_merge[2,3], trt_merge[2,4],trt_merge[2,6], trt_merge[2,7] )
+    TIME3 <- dist.pt (trt_merge[3,3], trt_merge[3,4],trt_merge[3,6], trt_merge[3,7] )
+    TIME4 <- dist.pt (trt_merge[4,3], trt_merge[4,4],trt_merge[4,6], trt_merge[4,7] )
+    TIME5 <- dist.pt (trt_merge[5,3], trt_merge[5,4],trt_merge[5,6], trt_merge[5,7] )
+    TIME6 <- dist.pt (trt_merge[6,3], trt_merge[6,4],trt_merge[6,6], trt_merge[6,7] )
+    TIME7 <- dist.pt (trt_merge[7,3], trt_merge[7,4],trt_merge[7,6], trt_merge[7,7] )
+    TIME8 <- dist.pt (trt_merge[8,3], trt_merge[8,4],trt_merge[8,6], trt_merge[8,7] )
+    TIME9 <- dist.pt (trt_merge[9,3], trt_merge[9,4],trt_merge[9,6], trt_merge[9,7] )
+    
+    
+    dist_btwn_community <- data.frame(i, j, TIME1, TIME2, TIME3, TIME4, TIME5, TIME6, TIME7, TIME8, TIME9)
+    dist_btw_trt_resident <-rbind(dist_btw_trt_resident, dist_btwn_community)
+  }
+}
+
+col_head <- c('Treat1',"Treat2", '1',"2", "3", "4", "5", "6", "7", "8", "9")
+colnames(dist_btw_trt_resident) <- col_head
+
+dist_btw_tidy_1_resident <- dist_btw_trt_resident %>%
+  gather(time, distance, 3:11) %>%
+  mutate(type =rep("centroid"))
+```
+
+```{r man_kendall assemblage A resident only}
+###################################################################################################
+# trajectory analysis 
+###################################################################################################
+exptime <- bamboo_community_res %>% select(Survey, FIRST) %>% group_by(Survey) %>% summarise_all(mean) %>%
+  mutate(time = as.character(Survey))
+dist_btw_tidy_1_resident <- merge(dist_btw_tidy_1_resident, exptime, by =c("time"))
+
+mk_cent <- dist_btw_tidy_1_resident %>% 
+  filter(Treat1== "Coevolved") %>%
+  filter(Treat2 == "Evolved residents") %>%
+  mutate(time = as.numeric(time))%>% arrange(time)
+
+mk_test1 <- mk.test(mk_cent$distance)
+mk_slope <- sens.slope(mk_cent$distance)
+
+mk_test1$estimates[3] # extract tau
+mk_test1$p.value # extract pvalue from trend test 
+mk_slope$estimates # extract slope 
+mk_slope$p.value
+
+# okay moving on... 
+trt_level_mk_test_resident <- dist_btw_tidy_1_resident %>% 
+  group_by(Treat1, Treat2) %>%  
+  mutate(day = as.numeric(FIRST))%>% 
+  arrange(day) %>%
+  mutate(mann_kendall_tau = mk.test(distance)$estimates[3],
+         mann_kendall_pvalue = mk.test(distance)$p.value,
+         sens_slope = sens.slope(distance)$estimate,
+         sens_pvalue = sens.slope(distance)$p.value) %>%
+  group_by(Treat1, Treat2) %>%
+  summarise_at(c("mann_kendall_tau", "mann_kendall_pvalue", "sens_slope", "sens_pvalue"), mean)
+
+```
+
+
+```{r graphic_convergence assemblage A resident only}
+converg_matrix <- trt_level_mk_test_resident %>% 
+  select(Treat1, Treat2, mann_kendall_tau) %>% # arrange(Treat1) %>% arrange(Treat)%>%
+  spread(Treat2, mann_kendall_tau) %>% 
+  replace(., is.na(.), 0)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+  cormat[upper.tri(cormat)] <- NA
+  return(cormat)
+}
+
+signif <- trt_level_mk_test_resident %>%
+mutate(signif.p = case_when((mann_kendall_pvalue < 0.05) ~ 0, 
+                              (mann_kendall_pvalue > 0.05) ~ 1))%>%
+  select(Treat1, Treat2, mann_kendall_pvalue, signif.p) 
+conv_low <- get_lower_tri(converg_matrix)
+convergence <- conv_low %>% 
+  gather(Treat2, mann_kendall_tau, 2:5) %>%
+  mutate(index = "Bray-Curtis")
+convergence_resdient <- merge(convergence, signif, by = c("Treat1", "Treat2"))
+
+mktrend <-convergence_resdient%>% 
+  ggplot(aes(x=Treat1, y = Treat2, fill=mann_kendall_tau))+
+  theme_bw(base_size =10)+
+  geom_raster(aes(x=Treat1, y = Treat2, fill=mann_kendall_tau))+
+  scale_fill_gradientn(limits = c(-1,1), 
+                       breaks=c(-1,0,1),
+                       colours=c('#d53e4f','#ffffbf','#3288bd'),
+                       na.value = 'white',
+                       name='Tau')+
+  labs(x="", y="") +
+  geom_text(aes(x=Treat1, y = Treat2, label=round(mann_kendall_tau,2)), size=3, vjust=1)+ 
+  geom_text(data=subset(convergence_resdient, mann_kendall_pvalue < 0.05), 
+            aes(x=Treat1, y = Treat2, label="*"), 
+            size=9, color="white", vjust=0.2, hjust=-1)+ 
+  geom_text(data=subset(convergence_resdient, mann_kendall_tau < -0.9),
+            aes(x=Treat1, y = Treat2, label=round(mann_kendall_tau,2)),
+            size=10, color="#bdbdbd",  vjust=1)+ 
+  theme(axis.title.x=element_blank(),
+        # axis.text.x=element_blank(),
+        # axis.ticks.x=element_blank(),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.background = element_blank(),
+        axis.ticks = element_blank(),
+        legend.justification = c(1, 0),
+        legend.position = c(0.5, 0.8),
+        legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                               title.position = "top", title.hjust = 0.5))+
+  theme(axis.text.x = element_text( angle=90))+
+  guides(fill=FALSE)
+#jpeg(filename="convergence_AssemblageA_residentonly.jpeg", width=90, height=120, units="mm", bg="white", res=300)
+mktrend
+#dev.off()
+
+```
+
+~~~~~~~~~~~~~~~~Population level analysis using mvabund mixed models 
+
+
+```{r mvabund model}
+library(mvabund)
+species_list <- list(bamboo_community[c(6:10,12)])
+treatment <- list(bamboo_community[c(3,19)])
+block <- list(bamboo_community[4])
+
+mv.list <-list(species_1 = species_list,
+              treatment_1 = treatment, 
+              block_1 = block)
+attach(mv.list)
+species.data <- mvabund(species_1)
+is.mvabund(species.data)
+
+#constrain the permutation within a jar by designating shuffletset; 
+#nrow = within the abundance data 
+#control within jar= block  
+permID <- shuffleSet(n=nrow(species.data), nset=999, control=how(block=bamboo_community$JAR))
+
+#set reference level
+bamboo_community <-bamboo_community %>% mutate(invader_evol=as.factor(invader_evol),
+                            resident_evol = as.factor(resident_evol),
+                            plot.trt =as.factor(plot.trt))
+bamboo_community$invader_evol <- relevel(bamboo_community$invader_evol, ref='naive')
+bamboo_community$resident_evol <- relevel(bamboo_community$resident_evol , ref='naive')
+bamboo_community$plot.trt <- relevel(bamboo_community$plot.trt , ref='Naive invasion')
+
+#community composition analysis
+  mod1 <- manyglm(species.data ~ (FIRST)* invader_evol *resident_evol, 
+                  data= bamboo_community,
+                  family='negative.binomial',
+                  show.residuals=T,
+                  show.coef = T)
+  
+    mod1.1 <- manyglm(species.data ~ (FIRST)* plot.trt, 
+                  data= bamboo_community,
+                  family='negative.binomial',
+                  show.residuals=T,
+                  show.coef = T)
+    
+plot.manyglm(mod1)
+coef(mod1)
+summary(mod1)
+#jpeg(filename="assemblageA_glm_coeff.jpeg", width=220, height=240, units="mm", bg="white", res=300)
+#coefplot(mod1)
+#dev.off()
+#summary(mod1)
+new <- data.frame(bamboo_community[c(15,18,20)])
+mod.pred <- predict.manyglm(mod1.1, new, type="response") 
+mod.pred.predictor <- predict.manyglm(mod1.1, new) 
+plot.mod <- cbind(new, mod.pred)
+
+#get SE for fitted line
+mod.pred.se <-predict.manyglm(mod1, new, type='response', se.fit=TRUE)
+se <- mod.pred.se$se.fit %>% as.data.frame()
+sp <- c("Blepharisma", "Spirostomum","Euplotes_patella","Euplotes_daidaleos1","Lecane","Paramecium_bursaria1") 
+colnames(se) <- sp
+
+#permutation for p values based on repeated measures 
+set.seed(12345)
+mod.out <- anova(mod1, bootID=permID, p.uni = 'adjusted', test = 'LR' )
+printCoefmat(mod.out$uni.p)
+mod.out
+
+#get table of p values for univariate tests for each species 
+AssembA.table <- as.data.frame(mod.out$uni.test)
+```
+
+Plot model predictions for multivariate glms 
+Note we need to back transform model fit 
+
+```{r model prediction plot}
+#back transformed model fitted line 
+plot.mod.2 <-plot.mod %>% 
+  gather(species, abundance, c(4:9))
+plot.se <- se %>%
+  gather(species, se, 1:6) %>% 
+  select(-c(species))
+#add SE measure to model fitted line 
+plot.mod.2$se <- plot.se$se
+plot.mod.2$plot.trt <- bamboo_community$plot.trt
+  
+#get means for plotting 
+mean.abund <-bamboo_community %>% 
+  ungroup()%>%
+  gather(species, abundance, c(6:10,12)) %>%
+  group_by(species, plot.trt,Survey)%>%
+  mutate(mean_abun=mean(abundance),
+         sd_abun= sd(abundance),
+         n_abun = 5) %>%
+  ungroup()%>%
+  group_by(species, plot.trt,Survey)%>%
+  mutate(se_abun = sd_abun / sqrt(n_abun),
+         lower_ci = mean_abun - qt(1 - (0.05 / 2), n_abun - 1) * se_abun,
+         upper_ci = mean_abun + qt(1 - (0.05 / 2), n_abun - 1) * se_abun)
+
+dodge <- position_dodge(width = 2)
+
+species_names <- list(
+'Blepharisma' = 'B. americanum',
+'Euplotes_daidaleos1' = 'E. daidaleos',
+'Euplotes_patella' = 'E. patella',
+'Lecane' = 'Lecane sp.',
+'Paramecium_bursaria1' = 'P. bursaria',
+'Spirostomum' = 'S. teres'
+)
+
+treatment_labeller <- function(variable,value){
+  return(species_names[value])
+}
+
+spp.abund.graph <-ggplot(aes(x=FIRST, y = (abundance), group=plot.trt, col=plot.trt), data= plot.mod.2) +
+  geom_line(aes(x=FIRST, y = (abundance), group=plot.trt, col=plot.trt),
+            lwd=2, data=plot.mod.2)+
+  geom_ribbon(aes(ymin = (abundance-se), ymax = (abundance+se),fill=plot.trt),
+              data = plot.mod.2,alpha = 0.5, colour = NA)+
+  geom_point(aes(x=FIRST, y = mean_abun, fill=plot.trt), 
+             data=mean.abund, pch=21, col='black', size=3, position=dodge)+
+  rita_theme+
+  facet_wrap(~species, scales='free_y', labeller = treatment_labeller, ncol=2) + 
+  scale_color_manual(values=colorpal)+
+  scale_fill_manual(values = colorpal)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15))+
+  theme(legend.title = element_text(size=8.5, face="bold"),
+        legend.text = element_text(size=14))+ 
+  theme(legend.position="top")+
+  guides(color=guide_legend(""), fill=FALSE)+
+  labs(x="time (days)", y ='abundance')
+
+#jpeg(filename="assemblageA_species_level.jpeg", width=220, height=240, units="mm", bg="white", res=300)
+spp.abund.graph
+#dev.off()
+
+
+```
+~~~~~~~~~~~ resident species only comparison 
+
+```{r mvabund model residents only}
+library(mvabund)
+species_list <- list(bamboo_community_res[c(6:9,11)])
+treatment <- list(bamboo_community_res[c(3,19)])
+block <- list(bamboo_community_res[4])
+
+mv.list.res <-list(species_1 = species_list,
+              treatment_1 = treatment, 
+              block_1 = block)
+attach(mv.list.res)
+species.data.res <- mvabund(species_1)
+is.mvabund(species.data.res)
+
+#constrain the permutation within a jar by designating shuffletset; 
+#nrow = within the abundance data 
+#control within jar= block  
+permID <- shuffleSet(n=nrow(species.data.res),
+                     nset=999, 
+                     control=how(block=bamboo_community_res$JAR))
+
+#set reference level
+bamboo_community_res <-bamboo_community_res %>% 
+  mutate(invader_evol=as.factor(invader_evol),
+         resident_evol = as.factor(resident_evol),
+         invasion = as.factor(invasion))
+bamboo_community_res$invader_evol <- relevel(bamboo_community_res$invader_evol, ref='naive')
+bamboo_community_res$resident_evol <- relevel(bamboo_community_res$resident_evol , ref='naive')
+bamboo_community_res$invasion <- relevel(bamboo_community_res$invasion , ref='uninvaded')
+
+#community composition analysis
+mod1.res <- manyglm(species.data.res ~ FIRST *invasion,
+                    data=bamboo_community_res,
+                    family='negative.binomial',
+                    show.residuals=T)
+mod1.res.plot <- manyglm(species.data.res ~ FIRST *plot.trt,
+                    data=bamboo_community_res,
+                    family='negative.binomial',
+                    show.residuals=T)
+plot.manyglm(mod1.res)
+summary(mod1.res)
+coef(mod1.res)
+#extract info to replot model results
+new <- data.frame(bamboo_community_res[c(14,16)])
+mod.pred.res <-predict(mod1.res.plot, new)
+plot.mod.res <- cbind(new, mod.pred.res)
+
+#get SE for fitted line
+mod.pred.se.res <-predict(mod1.res.plot, new, se=TRUE)
+se <- mod.pred.se.res$se.fit %>% as.data.frame()
+sp <- c("Blepharisma", "Spirostomum","Euplotes_patella","Lecane","Paramecium_bursaria1") 
+colnames(se) <- sp
+
+#permutation for p values based on repeated measures 
+set.seed(12345)
+mod.out.res <- anova.manyglm(mod1.res, bootID=permID,  p.uni = 'adjusted', test = 'LR')
+printCoefmat(mod.out.res$uni.p)
+mod.out.res
+
+#get table of p values for univariate tests for each species 
+AssembA.table.resident <- as.data.frame(mod.out.res$uni.p)
+```
+
+Graphic of species change
+
+```{r resident species populations}
+
+#back transformed model
+plot.mod.2.res <-plot.mod.res %>% 
+  gather(species, abundance, c(3:7))
+plot.se <- se %>%
+  gather(species, se, 1:5) %>% 
+  select(-c(species))
+plot.mod.2.res$se <- plot.se$se
+
+species_names <- list(
+'Blepharisma' = 'B. americanum',
+'Euplotes_daidaleos1' = 'E. daidaleos',
+'Euplotes_patella' = 'E. patella',
+'Lecane' = 'Lecane sp.',
+'Paramecium_bursaria1' = 'P. bursaria',
+'Spirostomum' = 'S. teres'
+)
+
+treatment_labeller <- function(variable,value){
+  return(species_names[value])
+}
+
+#get means for plotting 
+mean.abund.res <-bamboo_community_res %>% 
+  ungroup()%>%
+  gather(species, abundance, c(6:9,11)) %>%
+  group_by(species, plot.trt,Survey)%>%
+  mutate(mean_abun=mean(abundance),
+         sd_abun= sd(abundance),
+         n_abun = 5) %>%
+  ungroup()%>%
+  group_by(species, plot.trt,Survey)%>%
+  mutate(se_abun = sd_abun / sqrt(n_abun),
+         lower_ci = mean_abun - qt(1 - (0.05 / 2), n_abun - 1) * se_abun,
+         upper_ci = mean_abun + qt(1 - (0.05 / 2), n_abun - 1) * se_abun)
+
+dodge <- position_dodge(width = 2)
+  
+sp.abund.graphic.resident <-ggplot(aes(x=FIRST, y = exp(abundance), group=plot.trt, col=plot.trt), data= plot.mod.2.res) +
+  geom_ribbon(aes(ymin = exp(abundance-se), ymax = exp(abundance+se),fill=plot.trt),
+              data = plot.mod.2.res,alpha = 0.5, colour = NA)+
+    geom_line(aes(x=FIRST, y = exp(abundance), group=plot.trt, col=plot.trt),
+            lwd=2, data=plot.mod.2.res)+
+  geom_point(aes(x=FIRST, y = mean_abun, fill=plot.trt), 
+             data=mean.abund.res, pch=21, col='black', size=3, position=dodge)+
+  rita_theme+
+  facet_wrap(~species, scales='free_y', labeller = treatment_labeller, ncol=2) + 
+  scale_color_manual(values=c('#d7191c','#fdae61','#abdda4','#2b83ba', '#737373'))+
+  scale_fill_manual(values = colorpal2)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15))+
+  theme(legend.title = element_text(size=8.5, face="bold"),
+        legend.text = element_text(size=14))+ 
+  theme(legend.position="top")+
+  guides(color=guide_legend(""), fill=FALSE)+
+  labs(x="time (days)", y ='abundance')
+
+#jpeg(filename="assemblageA_species_level_residents.jpeg", width=180, height=180, units="mm", bg="white", res=300)
+sp.abund.graphic.resident
+#dev.off()
+```
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ DRIFT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To assess drift within a treatment, I calculated the distance from the centroid for each community within a treatment group.   
+
+```{r drift}
+###################################################################################################
+# calculate distance between communities and their centroid
+dist.pt <- function(x1, y1, x2, y2) sqrt((x2-x1)^2 + (y2-y1)^2) # finds distance between points 
+
+jar_list <- unique(bamboo_community$JAR)
+
+bamboo_nmds <- merge(bamboo_all, cent.bamboo, by =c ("plot.trt", "Survey"))
+
+dis_centroid <- data.frame()
+
+for (i in jar_list){
+
+    jar <- i
+    
+   # trt_merge <- bamboo_nmds %>% filter(JAR=="B1R1") %>% arrange(Survey)
+    trt_merge <- bamboo_nmds %>% 
+      filter  (JAR== i)%>%
+      arrange(Survey)
+    
+    TIME1 <- dist.pt (trt_merge[1,11], trt_merge[1,12],trt_merge[1,13], trt_merge[1,14] )
+    TIME2 <- dist.pt (trt_merge[2,11], trt_merge[2,12],trt_merge[2,13], trt_merge[2,14] )
+    TIME3 <- dist.pt (trt_merge[3,11], trt_merge[3,12],trt_merge[3,13], trt_merge[3,14] )
+    TIME4 <- dist.pt (trt_merge[4,11], trt_merge[4,12],trt_merge[4,13], trt_merge[4,14] )
+    TIME5 <- dist.pt (trt_merge[5,11], trt_merge[5,12],trt_merge[5,13], trt_merge[5,14] )
+    TIME6 <- dist.pt (trt_merge[6,11], trt_merge[6,12],trt_merge[6,13], trt_merge[6,14] )
+    TIME7 <- dist.pt (trt_merge[7,11], trt_merge[7,12],trt_merge[7,13], trt_merge[7,14] )
+    TIME8 <- dist.pt (trt_merge[8,11], trt_merge[8,12],trt_merge[8,13], trt_merge[8,14] )
+    TIME9 <- dist.pt (trt_merge[9,11], trt_merge[9,12],trt_merge[9,13], trt_merge[9,14] )
+    
+    dist_btwn_jar <- data.frame(i,trt_merge$plot.trt, 
+                                  TIME1, TIME2, TIME3, TIME4, 
+                                TIME5, TIME6, TIME7, 
+                                  TIME8, TIME9)
+    dis_centroid <-rbind(dis_centroid, dist_btwn_jar)
+
+}
+
+col_head <- c('JAR',
+              "plot.trt", 
+              '0', '14', '30', '36', '51', '56', '63', '70', '76')
+colnames(dis_centroid) <- col_head
+
+distance_centroid <- dis_centroid %>%
+  group_by(JAR, plot.trt) %>%
+  summarise_all(mean) %>%
+  gather(time, Distance,3:11)%>%
+  drop_na()
+```
+
+Visualize distance from centroid over time in the graphic below
+
+```{r drift graphic}
+
+distance_centroid %>% ggplot()+
+  geom_boxplot(aes(x=as.factor(time), y = Distance, fill=plot.trt))+ 
+ # facet_wrap(~plot.trt)+
+  labs(x="time", y = "distance to centroid")+
+  rita_theme+
+  guides(fill=FALSE)+
+  scale_fill_manual(values=colorpal)+
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        strip.text = element_text(size = 15)) # add black square panel around graphic
+
+#jpeg(filename="driftmodel_AssemblageA.jpeg", width=130, height=100, units="mm", bg="white", res=300)
+distance_centroid %>% ggplot(aes(x=(time), y = Distance, group=plot.trt))+
+  geom_point(aes(x=(time), y = Distance, fill=plot.trt), pch=21,
+             position=position_jitterdodge(dodge.width=0.5,  jitter.width = 0.25), size=2, alpha=0.5)+ 
+  geom_smooth(aes(x=(time), y = Distance, color=plot.trt, fill=plot.trt), method='lm', se=FALSE, lwd=2)+ 
+  scale_color_manual(values=colorpal)+
+  scale_fill_manual(values=colorpal)+
+  # facet_wrap(~plot.trt)+
+  labs(x="time", y = "distance to centroid")+
+  rita_theme+
+  theme(legend.title = element_text(size=8.5, face="bold"),
+        legend.text = element_text(size=8))+ 
+  guides(color=guide_legend(""), fill=FALSE)+
+  theme(legend.position="top")
+#dev.off()
+```
+Fit a mixed model
+
+```{r drift model}
+library(lmerTest)
+
+cent.model <-lmer((Distance) ~ as.numeric(time) * plot.trt+ (1|JAR), data= distance_centroid) #random intercept
+plot(cent.model)
+summary(cent.model)
+```
