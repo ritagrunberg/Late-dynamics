@@ -1,5 +1,5 @@
 # Late-dynamics
-Data and analysis for historical contigency for Faillace et al. 
+Data and analysis for 'Historical contingency and the role of post-invasion evolution in alternative community states.'  
 
 R scripts (2 markdown files used here)
 latedynamics_AssemblageA: R markdown file containing analyses for Assemblage A
